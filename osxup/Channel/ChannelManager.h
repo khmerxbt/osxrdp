@@ -3,6 +3,7 @@
 #define ChannelManager_h
 
 #include "xstream.h"
+class RdpAudioOutput;
 
 struct mod;
 
@@ -16,6 +17,10 @@ public:
     void SendClipboardServerInit();
     void SendClipboardChannelData(const void* data, int dataLen, int totalLen, int channelFlags);
     void Release();
+    void SendAudioServerInit();
+    bool IsAudioReady() const;
+    bool HandleAudioChannel(int channelId, int flags, const char* data, int size, int total);
+    void SendAudioPcm(const void* data, int bytes, unsigned int timestamp);
     
     int IsValidChannelMsg(int channelId, int channelFlags, const char* data, int dataLen, int totalLen);
     
@@ -24,6 +29,9 @@ private:
     const struct mod* _mod;
     
     int _clipboardChannelId;
+    int _audioChannelId = -1;
+    RdpAudioOutput* _audio;
+    bool _audioSentLogged = false;
     
     void _SendChannelData(xstream_t* stream);
 };

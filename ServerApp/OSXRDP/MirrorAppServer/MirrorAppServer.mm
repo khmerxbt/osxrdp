@@ -299,6 +299,10 @@ int MirrorAppServer::OnMessageReceived(xipc_t* t, xipc_t* client, void* data, in
                 ctx->ScreenRecorder->HandleCommand(client, cmd);
                 break;
             }
+            case OSXRDP_CMDTYPE_AUDIO_REMOTE: {
+                if (len == 8) ctx->ScreenRecorder->SetRemoteAudio(xstream_readInt32(cmd) == 1);
+                break;
+            }
             case OSXRDP_CMDTYPE_CLIPBOARD: {
                 ctx->Clipboard->HandleCommand(client, cmd);
                 break;

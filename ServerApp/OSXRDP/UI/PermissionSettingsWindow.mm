@@ -44,25 +44,15 @@
 }
 
 - (IBAction)accPermBtnClicked:(id)sender {
-    if (PermissionCheckUtils::HasAccPermission() == false) {
-        PermissionCheckUtils::ResetAccPermission();
-        PermissionCheckUtils::ShowAccPermissionRequestDialog();
-    }
-    else {
-        // update btn color
-        [self setEnabledBtnStyle: self.accPermBtn];
-    }
+    // Always open the matching settings pane, including when already granted.
+    // Resetting TCC here revoked access every time a stale check said no.
+    PermissionCheckUtils::ShowAccPermissionRequestDialog();
+    [self checkPermStatus];
 }
 
 - (IBAction)screenRecordBtnClicked:(id)sender {
-    if (PermissionCheckUtils::HasScreenRecordPermission() == false) {
-        PermissionCheckUtils::ResetScreenRecordPermission();
-        PermissionCheckUtils::ShowScreenRecordPermissionRequestDialog();
-    }
-    else {
-        // update btn color
-        [self setEnabledBtnStyle: self.recordPermBtn];
-    }
+    PermissionCheckUtils::ShowScreenRecordPermissionRequestDialog();
+    [self checkPermStatus];
 }
 
 - (IBAction)restartAppBtnClicked:(id)sender {

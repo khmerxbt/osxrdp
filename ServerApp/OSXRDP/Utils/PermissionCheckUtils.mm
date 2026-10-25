@@ -1,7 +1,9 @@
 
 #include "PermissionCheckUtils.h"
+#import <AppKit/AppKit.h>
 #include <CoreGraphics/CoreGraphics.h>
 #include <ApplicationServices/ApplicationServices.h>
+#import <ScreenCaptureKit/ScreenCaptureKit.h>
 
 bool PermissionCheckUtils::HasAccPermission() {
     return AXIsProcessTrustedWithOptions(nullptr) != 0 ? true : false;
@@ -29,10 +31,26 @@ void PermissionCheckUtils::ShowAccPermissionRequestDialog() {
     AXIsProcessTrustedWithOptions(options);
     
     CFRelease(options);
+    [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:
+        @"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"]];
 }
 
 void PermissionCheckUtils::ShowScreenRecordPermissionRequestDialog() {
-    CGRequestScreenCaptureAccess();
+    void (^openSettings)(void) = ^{
+        [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:
+            @"x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"]];
+    };
+    if (CGPreflightScreenCaptureAccess()) { openSettings(); return; }
+    // A real ScreenCaptureKit request registers this running app with TCC.
+    // Opening the pane alone cannot add an app or grant it permission.
+    if (@available(macOS 12.3, *)) {
+        [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent* content, NSError* error) {
+            dispatch_async(dispatch_get_main_queue(), openSettings);
+        }];
+    } else {
+        CGRequestScreenCaptureAccess();
+        openSettings();
+    }
 }
 
 void PermissionCheckUtils::ResetAccPermission() {

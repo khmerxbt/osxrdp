@@ -2,6 +2,9 @@
 #include "PaintRFX.h"
 #include "../osxup.h"
 #include <sys/mman.h>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 static const int RFX_TILE_BYTES = 64 * 64 * 4;
 static const int RFX_TILES_PER_COMMAND = 2048;
@@ -272,7 +275,18 @@ int PaintRFX::WriteCommands(const DisplayData* display, const screenrecord_frame
 void PaintRFX::CopyRFXTile(const unsigned char* src, int stride, unsigned char* dst, int width, int height) {
     for (int y = 0; y < height; y++) {
         const unsigned char* row = src + y * stride;
-        for (int x = 0; x < width; x++) {
+        int x = 0;
+#if defined(__aarch64__)
+        // Deinterleave sixteen Cr/Y/Cb pixels without changing their values.
+        // Keep the scalar tail for partial tiles at the screen's right edge.
+        for (; x + 16 <= width; x += 16) {
+            uint8x16x3_t pixels = vld3q_u8(row + x * 3);
+            vst1q_u8(dst + y * 64 + x, pixels.val[1]);
+            vst1q_u8(dst + 4096 + y * 64 + x, pixels.val[2]);
+            vst1q_u8(dst + 8192 + y * 64 + x, pixels.val[0]);
+        }
+#endif
+        for (; x < width; x++) {
             dst[y * 64 + x] = row[x * 3 + 1];          // Y
             dst[4096 + y * 64 + x] = row[x * 3 + 2];   // Cb
             dst[8192 + y * 64 + x] = row[x * 3];       // Cr

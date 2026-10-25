@@ -17,6 +17,8 @@ struct VIRTUALMONITOR_INFO {
     int refresh_rate;
 };
 
+@class OSXRDPWindowTransfer;
+
 class VirtualMonitor {
 public:
     VirtualMonitor();
@@ -26,7 +28,7 @@ public:
     bool Create(int width, int height, int left, int top, int index, bool isPrimary = false);
     
     // 모든 가상 모니터를 파괴
-    void Destroy();
+    void Destroy(bool preserveSession = false);
     
     // 가상 모니터를 제외한 나머지 모니터를 비활성화
     // 가상 모니터를 파괴 시 원래대로 돌아옴
@@ -63,6 +65,7 @@ private:
     int _virtualDisplayInfoCnt;
 
     bool _init;
+    bool _preserveSession = false;
     
     uint32_t* _disabledDisplayIds;
     int _disabledDisplayIdsCnt;
@@ -73,12 +76,26 @@ private:
     bool _watchRunning;
     IOPMAssertionID _displaySleepAssertion;
 
+    struct LOCAL_DISPLAY_LAYOUT {
+        CGDirectDisplayID id;
+        int x;
+        int y;
+    } _localDisplayLayout[32];
+    int _localDisplayLayoutCount;
+    NSMutableDictionary<NSNumber*, NSWindow*>* _privacyWindows;
+    OSXRDPWindowTransfer* _windowTransfer;
+    void SaveLocalDisplayLayout();
+    void RestoreLocalDisplayLayout(bool forget = true);
+    void UpdateLocalPrivacy();
+    void ClearLocalPrivacy();
+
     bool IsVirtualDisplay(CGDirectDisplayID displayId);
     bool IsAllVirtualDisplayOnline();
     int GetPrimaryDisplayIndex();
     bool IsRightPrimaryDisplay();
     bool IsRightDisplayLayout();
     int CalcRefreshRate(int width, int height);
+    static int CalcScale(int width, int height);
 
     int SetResolution(int index);
     bool IsRightResolution(int index);

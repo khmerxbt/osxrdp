@@ -47,13 +47,13 @@ void Command::SendRecordStartMsg(xipc_t* agentIpc, int width, int height, int re
     xstream_free(stream);
 }
 
-void Command::SendRecordStopMsg(xipc_t* agentIpc) {
+void Command::SendRecordStopMsg(xipc_t* agentIpc, bool forResize) {
     assert(agentIpc != NULL);
 
     xstream_t* stream = xstream_create(8);
 
     xstream_writeInt32(stream, OSXRDP_CMDTYPE_SCREEN);
-    xstream_writeInt32(stream, OSXRDP_PACKETTYPE_REQ_SCREENOFF);
+    xstream_writeInt32(stream, forResize ? OSXRDP_PACKETTYPE_REQ_RESIZE_STOP : OSXRDP_PACKETTYPE_REQ_SCREENOFF);
 
     _SendMsg(agentIpc, stream);
 

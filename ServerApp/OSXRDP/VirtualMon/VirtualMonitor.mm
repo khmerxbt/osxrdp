@@ -3,8 +3,181 @@
 
 #include <IOKit/pwr_mgt/IOPMLib.h>
 #include <unistd.h>
+#import <ApplicationServices/ApplicationServices.h>
 
 static const int kDisplayReconfigSettleUsec = 500 * 1000;
+
+// A nonactivating cover keeps local content out of view without disabling
+// display outputs. It deliberately does not claim to lock the macOS session.
+@interface OSXRDPPrivacyPanel : NSPanel
+@end
+@implementation OSXRDPPrivacyPanel
+- (BOOL)canBecomeKeyWindow { return NO; }
+- (BOOL)canBecomeMainWindow { return NO; }
+@end
+
+
+// AX coordinates, like CGDisplayBounds, start at the top left. Keeping these
+// separate from Cocoa's bottom-left coordinates avoids moving windows below
+// the desktop when a physical display has a negative vertical origin.
+static CGRect RemoteWorkArea(NSScreen* screen) {
+    CGRect display = CGDisplayBounds([screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue]);
+    NSRect visible = screen.visibleFrame, full = screen.frame;
+    return CGRectMake(display.origin.x + visible.origin.x - full.origin.x,
+        display.origin.y + NSMaxY(full) - NSMaxY(visible), visible.size.width, visible.size.height);
+}
+static BOOL ReadWindowFrame(AXUIElementRef window, CGRect* frame) {
+    CFTypeRef position = NULL, size = NULL;
+    BOOL ok = AXUIElementCopyAttributeValue(window, kAXPositionAttribute, &position) == kAXErrorSuccess
+        && AXUIElementCopyAttributeValue(window, kAXSizeAttribute, &size) == kAXErrorSuccess
+        && CFGetTypeID(position) == AXValueGetTypeID() && CFGetTypeID(size) == AXValueGetTypeID()
+        && AXValueGetValue((AXValueRef)position, kAXValueTypeCGPoint, &frame->origin)
+        && AXValueGetValue((AXValueRef)size, kAXValueTypeCGSize, &frame->size);
+    if (position) CFRelease(position);
+    if (size) CFRelease(size);
+    return ok && frame->size.width > 0 && frame->size.height > 0;
+}
+static BOOL SetWindowFrame(AXUIElementRef window, CGRect frame) {
+    AXValueRef size = AXValueCreate(kAXValueTypeCGSize, &frame.size);
+    AXValueRef point = AXValueCreate(kAXValueTypeCGPoint, &frame.origin);
+    AXUIElementSetAttributeValue(window, kAXSizeAttribute, size);
+    AXError error = AXUIElementSetAttributeValue(window, kAXPositionAttribute, point);
+    CFRelease(size); CFRelease(point);
+    return error == kAXErrorSuccess;
+}
+CGRect OSXRDPFitRemoteWindow(CGRect frame, CGRect work) {
+    frame.size.width = MIN(frame.size.width, work.size.width);
+    frame.size.height = MIN(frame.size.height, work.size.height);
+    frame.origin.x = MAX(work.origin.x, MIN(frame.origin.x, CGRectGetMaxX(work) - frame.size.width));
+    frame.origin.y = MAX(work.origin.y, MIN(frame.origin.y, CGRectGetMaxY(work) - frame.size.height));
+    return frame;
+}
+// Retained objects let queued main-thread work finish safely after C++ teardown.
+@interface OSXRDPWindowTransfer : NSObject
+- (void)snapshot;
+- (void)gather:(NSSet<NSNumber*>*)remoteIDs;
+- (void)restore;
+@end
+@implementation OSXRDPWindowTransfer {
+    NSMutableArray<NSMutableDictionary*>* _saved;
+    NSMutableArray<NSDictionary*>* _ownSaved;
+}
+- (instancetype)init { if ((self = [super init])) { _saved = [NSMutableArray array]; _ownSaved = [NSMutableArray array]; } return self; }
+- (NSMutableDictionary*)remember:(AXUIElementRef)window frame:(CGRect)frame {
+    for (NSMutableDictionary* saved in _saved)
+        if (CFEqual((__bridge CFTypeRef)saved[@"window"], window)) return saved;
+    NSMutableDictionary* saved = [@{@"window": (__bridge id)window,
+        @"frame": [NSValue valueWithRect:NSRectFromCGRect(frame)], @"moved": @NO} mutableCopy];
+    [_saved addObject:saved];
+    return saved;
+}
+- (void)enumerateWindows:(void(^)(AXUIElementRef, CGRect))block {
+    if (!AXIsProcessTrusted()) return;
+    for (NSRunningApplication* app in NSWorkspace.sharedWorkspace.runningApplications) {
+        if (app.processIdentifier == getpid() || app.activationPolicy != NSApplicationActivationPolicyRegular) continue;
+        AXUIElementRef axApp = AXUIElementCreateApplication(app.processIdentifier);
+        AXUIElementSetMessagingTimeout(axApp, 0.15);
+        CFTypeRef value = NULL;
+        if (AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute, &value) == kAXErrorSuccess
+            && CFGetTypeID(value) == CFArrayGetTypeID()) {
+            for (id object in (__bridge NSArray*)value) {
+                AXUIElementRef window = (__bridge AXUIElementRef)object;
+                AXUIElementSetMessagingTimeout(window, 0.15);
+                CFTypeRef title = NULL;
+                AXUIElementCopyAttributeValue(window, kAXTitleAttribute, &title);
+                BOOL isCover = title && CFGetTypeID(title) == CFStringGetTypeID()
+                    && CFEqual(title, CFSTR("OSXRDP local screen privacy"));
+                if (title) CFRelease(title);
+                if (isCover) continue;
+                CGRect frame;
+                if (ReadWindowFrame(window, &frame)) block(window, frame);
+            }
+        }
+        if (value) CFRelease(value);
+        CFRelease(axApp);
+    }
+}
+- (void)snapshot {
+    [_saved removeAllObjects];
+    [self enumerateWindows:^(AXUIElementRef window, CGRect frame) { [self remember:window frame:frame]; }];
+}
+- (void)gather:(NSSet<NSNumber*>*)remoteIDs {
+    NSMutableArray<NSValue*>* destinations = [NSMutableArray array];
+    for (NSScreen* screen in NSScreen.screens)
+        if ([remoteIDs containsObject:screen.deviceDescription[@"NSScreenNumber"]])
+            [destinations addObject:[NSValue valueWithRect:NSRectFromCGRect(RemoteWorkArea(screen))]];
+    if (!destinations.count) return;
+    // Our own UI must use AppKit: AX does not implement self-process windows.
+    for (NSWindow* window in NSApp.windows) {
+        if (!window.visible || [window isKindOfClass:OSXRDPPrivacyPanel.class]) continue;
+        BOOL remote = NO;
+        NSScreen* target = nil;
+        for (NSScreen* screen in NSScreen.screens) {
+            if (![remoteIDs containsObject:screen.deviceDescription[@"NSScreenNumber"]]) continue;
+            if (!target) target = screen;
+            if (NSPointInRect(NSMakePoint(NSMidX(window.frame), NSMidY(window.frame)), screen.frame)) remote = YES;
+        }
+        if (remote || !target) continue;
+        BOOL saved = NO;
+        for (NSDictionary* record in _ownSaved) if (record[@"window"] == window) saved = YES;
+        if (!saved) [_ownSaved addObject:@{@"window":window, @"frame":[NSValue valueWithRect:window.frame]}];
+        [window setFrame:NSRectFromCGRect(OSXRDPFitRemoteWindow(NSRectToCGRect(window.frame), NSRectToCGRect(target.visibleFrame))) display:YES];
+    }
+    __block int moved = 0;
+    [self enumerateWindows:^(AXUIElementRef window, CGRect frame) {
+        CFTypeRef minimized = NULL;
+        AXUIElementCopyAttributeValue(window, kAXMinimizedAttribute, &minimized);
+        BOOL skip = minimized && CFEqual(minimized, kCFBooleanTrue);
+        if (minimized) CFRelease(minimized);
+        if (skip) return;
+        CGPoint center = CGPointMake(CGRectGetMidX(frame), CGRectGetMidY(frame));
+        for (NSValue* destination in destinations)
+            if (CGRectContainsPoint(NSRectToCGRect(destination.rectValue), center)) return;
+        NSMutableDictionary* saved = [self remember:window frame:frame];
+        CFTypeRef fullscreen = NULL;
+        AXUIElementCopyAttributeValue(window, CFSTR("AXFullScreen"), &fullscreen);
+        BOOL isFullscreen = fullscreen && CFEqual(fullscreen, kCFBooleanTrue);
+        if (fullscreen) CFRelease(fullscreen);
+        if (isFullscreen) {
+            if (AXUIElementSetAttributeValue(window, CFSTR("AXFullScreen"), kCFBooleanFalse) == kAXErrorSuccess) {
+                saved[@"fullscreen"] = @YES; saved[@"moved"] = @YES;
+            }
+            return; // Let the Space transition settle before moving this window.
+        }
+        Boolean settable = false;
+        if (AXUIElementIsAttributeSettable(window, kAXPositionAttribute, &settable) != kAXErrorSuccess || !settable) return;
+        CGRect work = NSRectToCGRect(destinations[0].rectValue);
+        CGRect fitted = OSXRDPFitRemoteWindow(frame, work);
+        if (SetWindowFrame(window, fitted)) { saved[@"moved"] = @YES; moved++; }
+    }];
+    if (moved) NSLog(@"[OSXRDP windows] moved %d windows onto the remote display", moved);
+}
+- (void)restore {
+    for (NSDictionary* record in _ownSaved) {
+        NSWindow* window = record[@"window"];
+        NSRect original = [record[@"frame"] rectValue];
+        BOOL visible = NO;
+        for (NSScreen* screen in NSScreen.screens) if (NSIntersectsRect(original, screen.visibleFrame)) visible = YES;
+        if (!visible && NSScreen.mainScreen) original = NSRectFromCGRect(OSXRDPFitRemoteWindow(NSRectToCGRect(original), NSRectToCGRect(NSScreen.mainScreen.visibleFrame)));
+        [window setFrame:original display:YES];
+    }
+    [_ownSaved removeAllObjects];
+    int restored = 0;
+    for (NSDictionary* saved in _saved) {
+        if (![saved[@"moved"] boolValue]) continue;
+        AXUIElementRef window = (__bridge AXUIElementRef)saved[@"window"];
+        CGRect frame = NSRectToCGRect([saved[@"frame"] rectValue]);
+        BOOL visible = NO;
+        for (NSScreen* screen in NSScreen.screens)
+            if (CGRectIntersectsRect(frame, RemoteWorkArea(screen))) { visible = YES; break; }
+        if (!visible && NSScreen.mainScreen) frame = OSXRDPFitRemoteWindow(frame, RemoteWorkArea(NSScreen.mainScreen));
+        if (SetWindowFrame(window, frame)) restored++;
+        if ([saved[@"fullscreen"] boolValue]) AXUIElementSetAttributeValue(window, CFSTR("AXFullScreen"), kCFBooleanTrue);
+    }
+    [_saved removeAllObjects];
+    NSLog(@"[OSXRDP windows] restored %d local window positions", restored);
+}
+@end
 
 // 가상 모니터 해상도 목록
 //  이와 같이 구성을 채우지 않으면 macOS 가 이를 모니터가 아닌 다른 무언가로 인식하여 대화상자를 띄우는것 같음 (airplay 수신기?)
@@ -20,8 +193,11 @@ VirtualMonitor::VirtualMonitor() :
     _disabledDisplayIds(NULL),
     _disabledDisplayIdsCnt(0),
     _watchRunning(false),
-    _displaySleepAssertion(kIOPMNullAssertionID)
+    _displaySleepAssertion(kIOPMNullAssertionID),
+    _localDisplayLayoutCount(0)
 {
+    _privacyWindows = [NSMutableDictionary dictionary];
+    _windowTransfer = [OSXRDPWindowTransfer new];
     pthread_mutex_init(&_watchLock, 0);
     pthread_cond_init(&_watchWake, 0);
 }
@@ -36,11 +212,21 @@ VirtualMonitor::~VirtualMonitor() {
 bool VirtualMonitor::Create(int width, int height, int left, int top, int index, bool isPrimary) {
     if (_virtualDisplayInfoCnt >= 16) return false;
 
+    if (_virtualDisplayInfoCnt == 0 && !_preserveSession) {
+        SaveLocalDisplayLayout();
+        OSXRDPWindowTransfer* transfer = _windowTransfer;
+        // AX calls may run on the IPC thread. A fresh state object avoids a
+        // main-thread join/synchronous-dispatch deadlock during app shutdown.
+        _windowTransfer = [OSXRDPWindowTransfer new];
+        transfer = _windowTransfer;
+        [transfer snapshot];
+    }
+
     HoldDisplaySleepAssertion();
     WakeupDisplay();
 
     // retina 여부 판단
-    int scale = ((width > 3440) || (width > 2300 && height > 1500)) == true ? 2 : 1;
+    int scale = CalcScale(width, height);
     int refreshRate = CalcRefreshRate(width, height);
 
     // 가상 디스플레이를 생성
@@ -118,7 +304,9 @@ bool VirtualMonitor::Create(int width, int height, int left, int top, int index,
     return true;
 }
 
-void VirtualMonitor::Destroy() {
+void VirtualMonitor::Destroy(bool preserveSession) {
+    preserveSession = preserveSession && (_virtualDisplayInfoCnt > 0 || _preserveSession);
+    _preserveSession = preserveSession;
     // 가상 모미터 watch 스레드 정지
     if (_watchRunning == true) {
         _watchRunning = false;
@@ -126,13 +314,14 @@ void VirtualMonitor::Destroy() {
         pthread_join(_watchThread, NULL); // 완전히 정지할때까지 대기
     }
 
-    if (_disabledDisplayIdsCnt > 0) {
+    if (_disabledDisplayIdsCnt > 0 || _localDisplayLayoutCount > 0) {
         WakeupDisplay();
         usleep(kDisplayReconfigSettleUsec);
     }
 
     // 비활성화한 디스플레이 롤백 (반드시 먼저 해야함, 그렇지 않는 경우 위 설명처럼 windowserver 가 크래시할 수 있음)
     RestoreOtherMonitors();
+    RestoreLocalDisplayLayout(!preserveSession);
 
     for (int i = 0; i < _virtualDisplayInfoCnt; i++) {
         // nil 로 설정하면 알아서 뽀개짐 (즉시 뽀개지는건 아님)
@@ -141,9 +330,57 @@ void VirtualMonitor::Destroy() {
 
     _virtualDisplayInfoCnt = 0;
     memset(&_virtualDisplayInfo, 0x00, sizeof(_virtualDisplayInfo));
+    if (preserveSession) UpdateLocalPrivacy();
+    else ClearLocalPrivacy();
 
     _init = false;
-    ReleaseDisplaySleepAssertion();
+    if (!preserveSession) ReleaseDisplaySleepAssertion();
+}
+
+void VirtualMonitor::SaveLocalDisplayLayout() {
+    _localDisplayLayoutCount = 0;
+    uint32_t count = 0;
+    CGDirectDisplayID displays[32];
+    if (CGGetOnlineDisplayList(32, displays, &count) != kCGErrorSuccess) return;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (IsVirtualDisplay(displays[i])) continue;
+        CGRect bounds = CGDisplayBounds(displays[i]);
+        auto* saved = &_localDisplayLayout[_localDisplayLayoutCount++];
+        saved->id = displays[i];
+        saved->x = (int)bounds.origin.x;
+        saved->y = (int)bounds.origin.y;
+    }
+}
+
+void VirtualMonitor::RestoreLocalDisplayLayout(bool forget) {
+    if (_localDisplayLayoutCount == 0) return;
+    CGDisplayConfigRef cfg = NULL;
+    if (CGBeginDisplayConfiguration(&cfg) != kCGErrorSuccess) return;
+    bool ok = true;
+    int right = 0;
+    for (int i = 0; i < _localDisplayLayoutCount; ++i) {
+        const auto* saved = &_localDisplayLayout[i];
+        // This version never disables physical outputs. Skip unplugged screens;
+        // do not guess IDs or resurrect displays absent from the current list.
+        if (!DisplayUtils::IsDisplayOnline(saved->id)) continue;
+        CGRect bounds = CGDisplayBounds(saved->id);
+        right = MAX(right, saved->x + (int)bounds.size.width);
+        if (CGConfigureDisplayOrigin(cfg, saved->id, saved->x, saved->y) != kCGErrorSuccess) ok = false;
+    }
+    // Vacate the origin before deleting virtual screens, restoring the local
+    // primary display without leaving two screens claiming (0,0).
+    for (int i = 0; i < _virtualDisplayInfoCnt; ++i) {
+        auto* display = &_virtualDisplayInfo[i];
+        if (display->virtualDisplay == nil) continue;
+        if (CGConfigureDisplayOrigin(cfg, display->virtualDisplay.displayID,
+                                     right + 64, 0) != kCGErrorSuccess) ok = false;
+        right += display->width;
+    }
+    CGError error = kCGErrorFailure;
+    if (ok) error = CGCompleteDisplayConfiguration(cfg, kCGConfigureForAppOnly);
+    else CGCancelDisplayConfiguration(cfg);
+    NSLog(@"[OSXRDP local displays] restore layout result=%d", error);
+    if (forget) _localDisplayLayoutCount = 0;
 }
 
 void VirtualMonitor::RestoreOtherMonitors() {
@@ -162,11 +399,71 @@ void VirtualMonitor::RestoreOtherMonitors() {
 void VirtualMonitor::StartMonitor() {
     HoldDisplaySleepAssertion();
     WakeupDisplay();
+    UpdateLocalPrivacy();
 
     if (_watchRunning == false) {
         _watchRunning = true;
         pthread_create(&_watchThread , NULL, WatchThreadProc, this);
     }
+}
+
+void VirtualMonitor::UpdateLocalPrivacy() {
+    if (getuid() == 0) return;
+    NSMutableSet<NSNumber*>* remoteIDs = [NSMutableSet set];
+    for (int i = 0; i < _virtualDisplayInfoCnt; ++i) {
+        if (_virtualDisplayInfo[i].virtualDisplay != nil)
+            [remoteIDs addObject:@(_virtualDisplayInfo[i].virtualDisplay.displayID)];
+    }
+    // Capture retained objects, never this: queued work may outlive teardown.
+    NSMutableDictionary<NSNumber*, NSWindow*>* windows = _privacyWindows;
+    OSXRDPWindowTransfer* transfer = _windowTransfer;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [transfer gather:remoteIDs];
+        NSMutableSet<NSNumber*>* localIDs = [NSMutableSet set];
+        for (NSScreen* screen in [NSScreen screens]) {
+            NSNumber* displayID = screen.deviceDescription[@"NSScreenNumber"];
+            if (displayID == nil || [remoteIDs containsObject:displayID]) continue;
+            [localIDs addObject:displayID];
+            NSWindow* cover = windows[displayID];
+            if (cover == nil) {
+                cover = [[OSXRDPPrivacyPanel alloc] initWithContentRect:screen.frame
+                    styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
+                    backing:NSBackingStoreBuffered defer:NO screen:screen];
+                cover.title = @"OSXRDP local screen privacy";
+                cover.backgroundColor = [NSColor blackColor];
+                cover.opaque = YES;
+                cover.hasShadow = NO;
+                cover.releasedWhenClosed = NO;
+                cover.hidesOnDeactivate = NO;
+                cover.level = CGShieldingWindowLevel() + 1;
+                cover.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces
+                    | NSWindowCollectionBehaviorStationary
+                    | NSWindowCollectionBehaviorIgnoresCycle
+                    | NSWindowCollectionBehaviorFullScreenAuxiliary;
+                windows[displayID] = cover;
+                NSLog(@"[OSXRDP privacy] covering local display %@", displayID);
+            }
+            [cover setFrame:screen.frame display:YES];
+            [cover orderFrontRegardless];
+        }
+        for (NSNumber* displayID in [windows.allKeys copy]) {
+            if (![localIDs containsObject:displayID]) {
+                [windows[displayID] close];
+                [windows removeObjectForKey:displayID];
+            }
+        }
+    });
+}
+
+void VirtualMonitor::ClearLocalPrivacy() {
+    NSMutableDictionary<NSNumber*, NSWindow*>* windows = _privacyWindows;
+    OSXRDPWindowTransfer* transfer = _windowTransfer;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [transfer restore];
+        for (NSWindow* cover in windows.allValues) [cover close];
+        [windows removeAllObjects];
+        NSLog(@"[OSXRDP privacy] local display covers removed");
+    });
 }
 
 void VirtualMonitor::WakeupDisplay() {
@@ -447,7 +744,9 @@ int VirtualMonitor::SetResolution(int index) {
             size_t modeWidth = CGDisplayModeGetWidth(mode);
             size_t modeHeight = CGDisplayModeGetHeight(mode);
             
-            if (modeWidth == (displayInfo->width / 2) && modeHeight == (displayInfo->height / 2)) {
+            if (modeWidth == (displayInfo->width / 2) && modeHeight == (displayInfo->height / 2)
+                && CGDisplayModeGetPixelWidth(mode) == displayInfo->width
+                && CGDisplayModeGetPixelHeight(mode) == displayInfo->height) {
                 NSLog(@"found retina bestmode\n");
                 bestMode = mode;
                 break;
@@ -463,7 +762,9 @@ int VirtualMonitor::SetResolution(int index) {
                 size_t modeWidth = CGDisplayModeGetWidth(mode);
                 size_t modeHeight = CGDisplayModeGetHeight(mode);
                 
-                if (modeWidth == displayInfo->width && modeHeight == displayInfo->height) {
+                if (modeWidth == displayInfo->width && modeHeight == displayInfo->height
+                    && CGDisplayModeGetPixelWidth(mode) == displayInfo->width
+                    && CGDisplayModeGetPixelHeight(mode) == displayInfo->height) {
                     NSLog(@"found bestmode\n");
                     bestMode = mode;
                     break;
@@ -479,7 +780,9 @@ int VirtualMonitor::SetResolution(int index) {
             size_t modeWidth = CGDisplayModeGetWidth(mode);
             size_t modeHeight = CGDisplayModeGetHeight(mode);
             
-            if (modeWidth == displayInfo->width && modeHeight == displayInfo->height) {
+            if (modeWidth == displayInfo->width && modeHeight == displayInfo->height
+                && CGDisplayModeGetPixelWidth(mode) == displayInfo->width
+                && CGDisplayModeGetPixelHeight(mode) == displayInfo->height) {
                 NSLog(@"found bestmode\n");
                 bestMode = mode;
                 break;
@@ -645,6 +948,7 @@ int VirtualMonitor::ApplyDisplayLayout() {
     }
 
     bool configured = true;
+    int virtualRight = 0;
     for (int i = 0; i < _virtualDisplayInfoCnt; i++) {
         struct VIRTUALMONITOR_INFO* displayInfo = &_virtualDisplayInfo[i];
         if (displayInfo->virtualDisplay == nil) {
@@ -654,6 +958,8 @@ int VirtualMonitor::ApplyDisplayLayout() {
 
         int x = displayInfo->left - primaryInfo->left;
         int y = displayInfo->top - primaryInfo->top;
+        const int scale = displayInfo->is_retina ? 2 : 1;
+        virtualRight = MAX(virtualRight, x + displayInfo->width / scale);
 
         CGError configureErr = CGConfigureDisplayOrigin(cfg, displayInfo->virtualDisplay.displayID, x, y);
         if (configureErr != kCGErrorSuccess) {
@@ -664,6 +970,19 @@ int VirtualMonitor::ApplyDisplayLayout() {
         }
     }
 
+    // Keep local monitors powered on as an extended desktop. Place their
+    // original arrangement beside the virtual desktop instead of disabling
+    // outputs through private APIs, which can leave the Mac black on exit.
+    int localLeft = 0;
+    for (int i = 0; i < _localDisplayLayoutCount; ++i) {
+        localLeft = MIN(localLeft, _localDisplayLayout[i].x);
+    }
+    for (int i = 0; configured && i < _localDisplayLayoutCount; ++i) {
+        const auto* saved = &_localDisplayLayout[i];
+        if (!DisplayUtils::IsDisplayOnline(saved->id)) continue;
+        if (CGConfigureDisplayOrigin(cfg, saved->id,
+                virtualRight + 64 + saved->x - localLeft, saved->y) != kCGErrorSuccess) configured = false;
+    }
     if (configured == false) {
         CGCancelDisplayConfiguration(cfg);
         return 1;
@@ -718,8 +1037,7 @@ void VirtualMonitor::WatchThreadPorcInternal() {
         _init = true;
     }
     
-    // 가상 모니터를 제외한 다른 모니터가 온라인인지 확인
-    DisableOtherMonitors();
+    // Physical outputs remain enabled. Their arrangement is restored on exit.
     
     // 해상도 정보 확인 (가상 모니터)
     for (int i = 0; i < _virtualDisplayInfoCnt; i++) {
@@ -735,10 +1053,17 @@ void VirtualMonitor::WatchThreadPorcInternal() {
         NSLog(@"[VirtualMonitor::WatchThreadProc] virtual display has invalid layout. try change it");
         ApplyDisplayLayout();
     }
+    UpdateLocalPrivacy();
 }
 
 // EDID 의 픽셀 클럭 필드는 10kHz 단위 16비트라 macOS 는 655.35MHz 를 넘는 타이밍을 담지 못하는것으로 보인다. (추측, 여러 테스트를 기반)
 // 따라서 655.35 를 넘는 경우 주사율을 낮추는 식으로 우회한다.
+int VirtualMonitor::CalcScale(int width, int height) {
+    const int longEdge = MAX(width, height);
+    const int shortEdge = MIN(width, height);
+    return (longEdge > 3440 || (longEdge > 2300 && shortEdge > 1500)) ? 2 : 1;
+}
+
 int VirtualMonitor::CalcRefreshRate(int width, int height) {
     if (width <= 0 || height <= 0) return 45;
     

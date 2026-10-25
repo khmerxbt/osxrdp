@@ -21,6 +21,8 @@ public:
     
     // 초기 연결 수행
     bool Connect(const struct mod* mod);
+    bool Resize(struct mod* mod, int width, int height, int monitorCount,
+                const struct monitor_info* monitors);
     
     // ipc 메시지 펌프 및 연결 상태 확인
     void KeepAlive();
@@ -61,10 +63,13 @@ private:
     const mod* _mod;
     bool _pendingInputSync;
     int _pendingToggleFlags;
+    bool _resizePending;
+    bool _resizeCaptureReady;
     
     bool _ConnectToSessionManager();
     bool _ConnectToAgent(int sessionId, bool isLockScreen);
     bool _PreparePaint();
+    void _RequestRecording();
         
     void _HandleSessionMessage(int sessionId, int isLockScreen);
     

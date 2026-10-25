@@ -12,7 +12,7 @@ class Command {
 public:
     
     void SendRecordStartMsg(xipc_t* agentIpc, int width, int height, int recordFormat, int useVirtualmon, int monitorCount, struct monitor_info* monitorInfo);
-    void SendRecordStopMsg(xipc_t* agentIpc);
+    void SendRecordStopMsg(xipc_t* agentIpc, bool forResize = false);
     
     void SendMouseInputMsg(xipc_t* agentIpc, int inputType, short x, short y, int delta);
     void SendKeyboardInputMsg(xipc_t* agentIpc, int inputType, int keycode, int flags);
