@@ -5,6 +5,69 @@
 #import "../VirtualMon/DisplayUtils.h"
 #import <CoreMedia/CoreMedia.h>
 #include "utils.h"
+#import <CoreAudio/CoreAudio.h>
+#import <CoreAudio/CATapDescription.h>
+#import <CoreAudio/AudioHardwareTapping.h>
+
+// The tap affects hardware playback only. ScreenCaptureKit still supplies the
+// premute mix to RDP. MutedWhenTapped restores playback automatically if our
+// process dies; no device mute, volume or default-output setting is changed.
+@interface OSXRDPRemoteAudioRoute : NSObject
+- (BOOL)start;
+- (void)stop;
+@end
+@implementation OSXRDPRemoteAudioRoute {
+    AudioObjectID _tap;
+    AudioDeviceID _aggregate;
+    AudioDeviceIOProcID _io;
+    dispatch_queue_t _queue;
+}
+- (BOOL)start {
+    if (_tap) return YES;
+    if (@available(macOS 14.2, *)) {
+        CATapDescription* description = [[CATapDescription alloc] initStereoGlobalTapButExcludeProcesses:@[]];
+        description.name = @"OSXRDP remote-only playback";
+        description.privateTap = YES;
+        description.muteBehavior = CATapMutedWhenTapped;
+        OSStatus status = AudioHardwareCreateProcessTap(description, &_tap);
+        if (status != noErr) { NSLog(@"[OSXRDP audio] local playback tap failed: %d", status); return NO; }
+        NSDictionary* config = @{
+            @kAudioAggregateDeviceNameKey: @"OSXRDP private audio route",
+            @kAudioAggregateDeviceUIDKey: NSUUID.UUID.UUIDString,
+            @kAudioAggregateDeviceIsPrivateKey: @YES,
+            @kAudioAggregateDeviceTapAutoStartKey: @YES,
+            @kAudioAggregateDeviceTapListKey: @[@{
+                @kAudioSubTapUIDKey: description.UUID.UUIDString,
+                @kAudioSubTapDriftCompensationKey: @YES
+            }]
+        };
+        status = AudioHardwareCreateAggregateDevice((__bridge CFDictionaryRef)config, &_aggregate);
+        if (status == noErr) {
+            _queue = dispatch_queue_create("osxrdp.audio.local-route", DISPATCH_QUEUE_SERIAL);
+            status = AudioDeviceCreateIOProcIDWithBlock(&_io, _aggregate, _queue,
+                ^(const AudioTimeStamp* now, const AudioBufferList* input,
+                  const AudioTimeStamp* inputTime, AudioBufferList* output, const AudioTimeStamp* outputTime) {
+                    // Reading the tap suppresses hardware playback. PCM comes from ScreenCaptureKit.
+                });
+        }
+        if (status == noErr) status = AudioDeviceStart(_aggregate, _io);
+        if (status != noErr) { NSLog(@"[OSXRDP audio] private route failed: %d", status); [self stop]; return NO; }
+        NSLog(@"[OSXRDP audio] remote-only playback enabled");
+        return YES;
+    }
+    return NO;
+}
+- (void)stop {
+    if (@available(macOS 14.2, *)) {
+        if (_io) { AudioDeviceStop(_aggregate, _io); AudioDeviceDestroyIOProcID(_aggregate, _io); _io = NULL; }
+        if (_aggregate) { AudioHardwareDestroyAggregateDevice(_aggregate); _aggregate = 0; }
+        if (_tap) { AudioHardwareDestroyProcessTap(_tap); _tap = 0; NSLog(@"[OSXRDP audio] local playback restored"); }
+        _queue = nil;
+    }
+}
+- (void)dealloc { [self stop]; }
+@end
+
 
 #define _ALIGN_DOWN_EVEN(v)   ((v) & ~1)
 #define _ALIGN_UP_EVEN(v)     (((v) + 1) & ~1)
@@ -41,6 +104,7 @@ ScreenRecorderManager::ScreenRecorderManager(bool useLegacyRecorder) :
     _useLegacyRecorder(useLegacyRecorder),
     _recordShmCnt(0)
 {
+    _remoteAudioRoute = [OSXRDPRemoteAudioRoute new];
     memset(_recordShm, 0x00, sizeof(_recordShm));
     ResetPendingDirty();
 }
@@ -55,6 +119,10 @@ bool ScreenRecorderManager::StartRecord(xstream_t* cmd) {
     if (ParseStartRecordParams(cmd, &_recordParams) == false) {
         return false;
     }
+
+    NSLog(@"[OSXRDP capture] requested %dx%d format=%d fps=%d virtual=%d monitors=%d",
+          _recordParams.width, _recordParams.height, _recordParams.recordFormat,
+          _recordParams.framerate, _recordParams.useVirtualMon, _recordParams.monitorCount);
 
     if (_recordParams.recordFormat == OSXRDP_RECORDFORMAT_RFX && InitRFXConversion() == false) {
         return false;
@@ -104,6 +172,9 @@ bool ScreenRecorderManager::StartRecord(xstream_t* cmd) {
                     RecordFormat:_recordParams.recordFormat
                     RecordDataCallback:recordDataCb RecordDataCallbackUserData:this
                     RecordCmdCallback:HandleRecordCommand RecordCmdCallbackUserData:this];
+        // Capture system audio once, regardless of the number of displays.
+        if (i == 0 && !is_root_process() && [impl respondsToSelector:@selector(setAudioCallback:userData:)])
+            [impl setAudioCallback:HandleAudio userData:this];
 
         if ([impl start] == NO) {
             DestroyRecordShm();
@@ -115,6 +186,7 @@ bool ScreenRecorderManager::StartRecord(xstream_t* cmd) {
         _recorderCnt++;
     }
 
+    SetRemoteAudio(_remoteAudioEnabled);
     return true;
 }
 
@@ -151,15 +223,8 @@ bool ScreenRecorderManager::ParseStartRecordParams(xstream_t* cmd, RecordStartPa
         params->framerate = 30;
     }
     else {
-        if (params->recordFormat == OSXRDP_RECORDFORMAT_NV12_ALIGNED) {
-            params->framerate = 60;
-        }
-        else if (params->recordFormat == OSXRDP_RECORDFORMAT_NV12_PACKED) {
-            params->framerate = 60;
-        }
-        else {
-            params->framerate = 30;
-        }
+        // Respect the requested frame rate for bitmap and RFX clients too.
+        params->framerate = MAX(1, MIN(params->framerate, 60));
     }
     
     bool forceSingleMonitor = (params->useVirtualMon == 0 || params->recordFormat != OSXRDP_RECORDFORMAT_NV12_PACKED);
@@ -409,7 +474,19 @@ void ScreenRecorderManager::DestroyCursorShm() {
     _cursorShm = NULL;
 }
 
-void ScreenRecorderManager::Stop() {
+void ScreenRecorderManager::SetRemoteAudio(bool enabled) {
+    _remoteAudioEnabled = enabled && !is_root_process() && !_useLegacyRecorder;
+    BOOL captureActive = NO;
+    for (int i = 0; i < _recorderCnt; ++i) {
+        id<IScreenRecorder> recorder = (__bridge id<IScreenRecorder>)_recorder[i];
+        if ([recorder respondsToSelector:@selector(isAudioActive)] && [recorder isAudioActive]) captureActive = YES;
+    }
+    if (_remoteAudioEnabled && captureActive) [_remoteAudioRoute start];
+    else [_remoteAudioRoute stop];
+}
+
+void ScreenRecorderManager::Stop(bool forResize) {
+    if (!forResize) [_remoteAudioRoute stop];
     _inputHandler.ReleaseAllInputs();
 
     // 화면 녹화를 먼저 정지
@@ -433,7 +510,7 @@ void ScreenRecorderManager::Stop() {
         _virtualMonitor.ReleaseDisplaySleepAssertion();
     }
     
-    _virtualMonitor.Destroy();
+    _virtualMonitor.Destroy(forResize);
 
     // 공유 메모리 정리
     DestroyRecordShm();
@@ -467,6 +544,12 @@ void ScreenRecorderManager::HandleCommand(xipc_t* client, xstream_t* cmd) {
                 xstream_free(result);
             }
             
+            break;
+        }
+        case OSXRDP_PACKETTYPE_REQ_RESIZE_STOP: {
+            // Keep physical-screen covers, original window positions and local
+            // playback suppression across capture/virtual-display recreation.
+            Stop(true);
             break;
         }
         case OSXRDP_PACKETTYPE_REQ_SCREENOFF: {
@@ -1025,4 +1108,21 @@ void ScreenRecorderManager::HandleRecordCommand(int cmd, void* userData) {
     if (cmd == 1) {
         _this->SendDisconnectMsgToClient();
     }
+}
+
+void ScreenRecorderManager::HandleAudio(const int16_t* pcm, int frames, uint32_t timestamp, void* userData) {
+    auto* recorder = (ScreenRecorderManager*)userData;
+    if (!recorder || !recorder->_client || !pcm || frames <= 0 || frames > 1024) return;
+    xipc_t* client = recorder->_client;
+    // Audio is disposable in congestion. Never accumulate an audio backlog
+    // behind video/control traffic; this callback has a single producer.
+    pthread_mutex_lock(&client->lock);
+    bool busy = client->out_msgs != NULL;
+    pthread_mutex_unlock(&client->lock);
+    if (busy) return;
+    unsigned char packet[12 + 4096];
+    int type = OSXRDP_CMDTYPE_AUDIO, bytes = frames * 4;
+    memcpy(packet, &type, 4); memcpy(packet + 4, &timestamp, 4);
+    memcpy(packet + 8, &bytes, 4); memcpy(packet + 12, pcm, bytes);
+    xipc_send_data(client, packet, 12 + bytes);
 }

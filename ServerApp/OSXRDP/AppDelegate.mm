@@ -43,6 +43,15 @@
 
     [self setupStatusBar];
     [self.mainWindowController initializeMainUI];
+    [self onOpenWindowMenuClicked];
+}
+
+- (BOOL)applicationShouldHandleReopen:(NSApplication *)sender hasVisibleWindows:(BOOL)flag {
+    extern int g_Lockscreen;
+    if (g_Lockscreen == 0) {
+        [self onOpenWindowMenuClicked];
+    }
+    return YES;
 }
 
 - (void)applicationWillTerminate:(NSNotification *)aNotification {
@@ -55,9 +64,13 @@
 
 - (void)setupStatusBar {
     _trayMenu = [[NSStatusBar systemStatusBar] statusItemWithLength:NSSquareStatusItemLength];
+    _trayMenu.autosaveName = @"OSXRDPStatusItem";
+    _trayMenu.visible = YES;
 
     NSImage* img = [NSImage imageWithSystemSymbolName:@"bolt.horizontal.circle.fill" accessibilityDescription:NSLocalizedString(@"statusbar.icon.accessibility", nil)];
-    _trayMenu.button.image = img;
+    _trayMenu.button.image = img ?: [NSImage imageNamed:NSImageNameComputer];
+    _trayMenu.button.title = @"";
+    _trayMenu.button.toolTip = @"OSXRDP — Remote Desktop";
 
     NSMenu* menus = [[NSMenu alloc] init];
     [menus addItemWithTitle:NSLocalizedString(@"statusbar.menu.title", nil) action:nil keyEquivalent:@""];

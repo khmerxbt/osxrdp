@@ -1,8 +1,11 @@
+// Keep C++ standard-library headers ahead of the existing C atomic SHM ABI.
+#include "RdpAudioOutput.h"
 #include "../pch.h"
 #include "ChannelManager.h"
 #include "osxrdp/packet.h"
 #include "../osxup.h"
 #include "xstream.h"
+#include <syslog.h>
 
 static const int CB_MONITOR_READY = 1;
 static const int CB_CLIP_CAPS = 7;
@@ -19,10 +22,10 @@ ChannelManager::ChannelManager() :
     _inited(false),
     _mod(NULL),
     _clipboardChannelId(-1)
-{}
+{ _audio = new RdpAudioOutput(); }
 
 ChannelManager::~ChannelManager()
-{}
+{ delete _audio; }
 
 
 bool ChannelManager::Initialize(const struct mod* mod) {
@@ -30,6 +33,7 @@ bool ChannelManager::Initialize(const struct mod* mod) {
 
     _mod = mod;
     _inited = true;
+    _audioChannelId = mod->server_get_channel_id((struct mod*)mod, RDPSND_SVC_CHANNEL_NAME);
     
     // 클립보드 채널 id 조회
     _clipboardChannelId = mod->server_get_channel_id((struct mod*)mod, CLIPRDR_SVC_CHANNEL_NAME);
@@ -97,9 +101,47 @@ void ChannelManager::SendClipboardChannelData(const void* data, int dataLen, int
 }
 
 void ChannelManager::Release() {
+    _audio->Reset();
+    _audioChannelId = -1;
     _mod = NULL;
     _clipboardChannelId = -1;
     _inited = false;
+}
+
+void ChannelManager::SendAudioServerInit() {
+    if (!_mod || _audioChannelId < 0) return;
+    _audioSentLogged = false;
+    _audio->Start([](void* context, const uint8_t* data, size_t size) {
+        auto* self = (ChannelManager*)context;
+        for (size_t offset = 0; offset < size;) {
+            size_t count = size-offset > 1600 ? 1600 : size-offset;
+            int flags = (offset == 0 ? XR_CHANNEL_FLAG_FIRST : 0)
+                | (offset+count == size ? XR_CHANNEL_FLAG_LAST : 0);
+            int result = self->_mod->server_send_to_channel((struct mod*)self->_mod, self->_audioChannelId,
+                (char*)data+offset, (int)count, (int)size, flags);
+            if (result != 0) return result;
+            offset += count;
+        }
+        return 0;
+    }, this);
+    syslog(LOG_NOTICE, "[OSXRDP audio] offered 48000 Hz stereo PCM on rdpsnd");
+}
+
+bool ChannelManager::IsAudioReady() const { return _audio->Ready(); }
+
+bool ChannelManager::HandleAudioChannel(int channelId, int flags, const char* data, int size, int total) {
+    if (_audioChannelId < 0 || channelId != _audioChannelId) return false;
+    bool ready = _audio->Ready();
+    if (size > 0 && total > 0) _audio->Receive((const uint8_t*)data, size, flags, total);
+    if (!ready && _audio->Ready()) syslog(LOG_NOTICE, "[OSXRDP audio] client formats and training ready");
+    return true;
+}
+
+void ChannelManager::SendAudioPcm(const void* data, int bytes, unsigned int timestamp) {
+    if (bytes > 0 && _audio->Pcm(data, bytes, timestamp) && !_audioSentLogged) {
+        _audioSentLogged = true;
+        syslog(LOG_NOTICE, "[OSXRDP audio] first PCM packet delivered to client channel");
+    }
 }
 
 // rdp 의 다양한 채널 중 클립보드만 처리 (아직까지는)

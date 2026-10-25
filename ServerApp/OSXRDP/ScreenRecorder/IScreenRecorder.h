@@ -12,6 +12,7 @@
 
 typedef void (*on_record_data)(void* pixelBuffer, const CGRect* dirtyRects, int dirtyRectsCnt, void* userData, int displayIdx);
 typedef void (*on_record_cmd)(int cmd, void* userData);
+typedef void (*on_record_audio)(const int16_t* pcm, int frames, uint32_t timestamp, void* userData);
 
 @protocol IScreenRecorder<NSObject>
 
@@ -28,6 +29,10 @@ typedef void (*on_record_cmd)(int cmd, void* userData);
             RecordCmdCallbackUserData:(void*)userData2;
 - (BOOL)start;
 - (BOOL)stop;
+
+@optional
+- (BOOL)isAudioActive;
+- (void)setAudioCallback:(on_record_audio)callback userData:(void*)userData;
 
 @end
 

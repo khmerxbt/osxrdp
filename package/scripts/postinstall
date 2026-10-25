@@ -4,10 +4,13 @@
 /Applications/osxrdp/OSXRDP.app/Contents/MacOS/xrdp-keygen xrdp auto
 
 # generate tls key
+# Keep the unencrypted TLS private key readable only by the service owner.
+(umask 077
 /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes \
     -keyout /etc/xrdp/key.pem \
     -out  /etc/xrdp/cert.pem \
-    -days 3650 -subj "/CN=osxrdp"
+    -days 3650 -subj "/CN=osxrdp") || exit 1
+chmod 600 /etc/xrdp/key.pem || exit 1
 
 # create log file (xrdp)
 touch /var/log/xrdp.log

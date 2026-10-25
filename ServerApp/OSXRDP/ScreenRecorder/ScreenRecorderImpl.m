@@ -2,6 +2,8 @@
 
 #import <Foundation/Foundation.h>
 #import <CoreMedia/CoreMedia.h>
+#include <math.h>
+#include <time.h>
 #include "osxrdp/packet.h"
 #include "osxrdp/screenrecordshm.h"
 
@@ -15,6 +17,11 @@
     void* _recordCbUserData;
     void* _recordCmdCbUserData;
     int _displayIdx;
+    BOOL _loggedFirstFrame;
+    BOOL _loggedAudio;
+    uint64_t _profileStartNs, _profileFrames, _profileWorkNs;
+    on_record_audio _audioCb;
+    void* _audioUserData;
     
     CGRect _dirtyRectBuffer[MAX_DIRTY_COUNT];
 }
@@ -58,7 +65,8 @@ int SetDirtyAreaInfoFromSampleBuffer(CMSampleBufferRef sampleBuffer, CGRect* rec
     _recordConfig.height = height;
     _recordConfig.queueDepth = 3;
     
-    //_recordConfig.colorSpaceName = kCGColorSpaceSRGB;
+    // RDP clients consume SDR RGB; convert the display profile before capture.
+    _recordConfig.colorSpaceName = kCGColorSpaceSRGB;
     
     if (recordFormat == OSXRDP_RECORDFORMAT_NV12_PACKED || recordFormat == OSXRDP_RECORDFORMAT_NV12_ALIGNED) {
         // h264 사용 시
@@ -79,7 +87,7 @@ int SetDirtyAreaInfoFromSampleBuffer(CMSampleBufferRef sampleBuffer, CGRect* rec
         _recordConfig.preservesAspectRatio = NO;
     }
     
-    _recordConfig.minimumFrameInterval = CMTimeMake(100, framerate * 105);
+    _recordConfig.minimumFrameInterval = CMTimeMake(1, MAX(1, framerate));
     
     // 녹화 큐 설정
     dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0);
@@ -94,6 +102,9 @@ int SetDirtyAreaInfoFromSampleBuffer(CMSampleBufferRef sampleBuffer, CGRect* rec
     _recordCmdCbUserData = userData2;
     
     _displayIdx = displayIdx;
+    _loggedFirstFrame = NO;
+    _profileStartNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    _profileFrames = _profileWorkNs = 0;
 }
 
 - (BOOL)start {
@@ -123,6 +134,14 @@ int SetDirtyAreaInfoFromSampleBuffer(CMSampleBufferRef sampleBuffer, CGRect* rec
         NSLog(@"[ScreenRecorderImpl::start] addStreamOutput failed. %ld\n", err.code);
         
         return NO;
+    }
+    if (_audioCb != NULL) {
+        [_recordStream addStreamOutput:self type:SCStreamOutputTypeAudio sampleHandlerQueue:_recordQue error:&err];
+        if (err != nil) {
+            NSLog(@"[OSXRDP audio] adding audio output failed: %@", err);
+            // Video remains usable if this OS cannot supply audio.
+            _audioCb = NULL;
+        }
     }
     
     NSLog(@"[ScreenRecorderImpl::start] before start record\n");
@@ -154,6 +173,12 @@ int SetDirtyAreaInfoFromSampleBuffer(CMSampleBufferRef sampleBuffer, CGRect* rec
     else {
         NSError* err = nil;
         [_recordStream removeStreamOutput:self type:SCStreamOutputTypeScreen error:&err];
+        if (_audioCb != NULL)
+            [_recordStream removeStreamOutput:self type:SCStreamOutputTypeAudio error:nil];
+        // Stop is called by the IPC owner, never by the sample queue. Drain
+        // queued samples before its manager and client socket can be released.
+        dispatch_sync(_recordQue, ^{});
+        _audioCb = NULL;
         _recordStream = nil;
         _recordFilter = nil;
         _recordConfig = nil;
@@ -165,6 +190,11 @@ int SetDirtyAreaInfoFromSampleBuffer(CMSampleBufferRef sampleBuffer, CGRect* rec
 }
 
 - (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer ofType:(SCStreamOutputType)type {
+    if (type == SCStreamOutputTypeAudio) {
+        [self handleAudioSample:sampleBuffer];
+        return;
+    }
+    if (type != SCStreamOutputTypeScreen) return;
     
     // dirty area 정보 추출
     int dirtyAreaCnt = SetDirtyAreaInfoFromSampleBuffer(sampleBuffer, _dirtyRectBuffer);
@@ -177,13 +207,97 @@ int SetDirtyAreaInfoFromSampleBuffer(CMSampleBufferRef sampleBuffer, CGRect* rec
     if (pixelBuffer == NULL) {
         return;
     }
+    if (!_loggedFirstFrame) {
+        _loggedFirstFrame = YES;
+        CGColorSpaceRef space = CVImageBufferGetColorSpace(pixelBuffer);
+        CFStringRef name = space != NULL ? CGColorSpaceCopyName(space) : NULL;
+        NSLog(@"[OSXRDP capture buffer] actual=%zux%zu format=%u colorSpace=%@",
+              CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer),
+              (unsigned)CVPixelBufferGetPixelFormatType(pixelBuffer),
+              name != NULL ? (__bridge NSString*)name : @"unnamed");
+        if (name != NULL) CFRelease(name);
+    }
 
+    uint64_t before = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
     
     // 콜백 호출 (osxup 로 화면 데이터 전송)
     _recordCb(pixelBuffer, _dirtyRectBuffer, dirtyAreaCnt, _recordCbUserData, _displayIdx);
 
     CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    _profileFrames++; _profileWorkNs += now - before;
+    if (_profileStartNs && now - _profileStartNs >= 5000000000ULL) {
+        NSLog(@"[OSXRDP capture rate] display=%d fps=%.1f callback_ms=%.2f", _displayIdx,
+            _profileFrames * 1e9 / (now - _profileStartNs), _profileWorkNs / (1e6 * _profileFrames));
+        _profileStartNs = now; _profileFrames = _profileWorkNs = 0;
+    }
+}
+
+- (BOOL)isAudioActive { return _audioCb != NULL && _recordStream != nil; }
+
+- (void)setAudioCallback:(on_record_audio)callback userData:(void*)userData {
+    if (@available(macOS 13.0, *)) {
+        _audioCb = callback;
+        _audioUserData = userData;
+        _recordConfig.capturesAudio = callback != NULL;
+        _recordConfig.sampleRate = 48000;
+        _recordConfig.channelCount = 2;
+        _recordConfig.excludesCurrentProcessAudio = YES;
+    }
+}
+
+- (void)handleAudioSample:(CMSampleBufferRef)sample {
+    if (_audioCb == NULL || !CMSampleBufferDataIsReady(sample)) return;
+    const AudioStreamBasicDescription* format = CMAudioFormatDescriptionGetStreamBasicDescription(
+        CMSampleBufferGetFormatDescription(sample));
+    if (!format || format->mFormatID != kAudioFormatLinearPCM || format->mSampleRate != 48000
+        || format->mChannelsPerFrame != 2 || (format->mFormatFlags & kAudioFormatFlagIsBigEndian)) return;
+    BOOL floating = (format->mFormatFlags & kAudioFormatFlagIsFloat) != 0;
+    BOOL planar = (format->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
+    if ((floating && format->mBitsPerChannel != 32)
+        || (!floating && (format->mBitsPerChannel != 16 || !(format->mFormatFlags & kAudioFormatFlagIsSignedInteger)))) return;
+    struct { AudioBufferList list; AudioBuffer extra; } storage = {0};
+    AudioBufferList* buffers = &storage.list;
+    CMBlockBufferRef retained = NULL;
+    size_t required = 0;
+    OSStatus status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sample, &required,
+        NULL, 0, NULL, NULL, 0, NULL);
+    if (status != noErr || required > sizeof(storage)) return;
+    status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sample, &required,
+        buffers, required, kCFAllocatorDefault, kCFAllocatorDefault,
+        kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment, &retained);
+    if (status != noErr) { if (retained) CFRelease(retained); return; }
+    CMItemCount frames = CMSampleBufferGetNumSamples(sample);
+    size_t bytesPerSample = floating ? 4 : 2;
+    BOOL valid = frames > 0 && frames <= 48000 && buffers->mNumberBuffers == (planar ? 2 : 1);
+    for (unsigned i = 0; valid && i < buffers->mNumberBuffers; ++i) {
+        valid = buffers->mBuffers[i].mData != NULL
+            && buffers->mBuffers[i].mDataByteSize >= (size_t)frames * bytesPerSample * (planar ? 1 : 2);
+    }
+    if (valid) {
+        if (!_loggedAudio) {
+            _loggedAudio = YES;
+            NSLog(@"[OSXRDP audio] capturing 48000 Hz stereo PCM");
+        }
+        double seconds = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample));
+        if (!isfinite(seconds) || seconds < 0) seconds = 0;
+        uint32_t timestamp = (uint32_t)fmod(seconds * 1000.0, 4294967296.0);
+        int16_t pcm[1024 * 2];
+        for (CMItemCount first = 0; first < frames; first += 1024) {
+            int count = (int)MIN(1024, frames - first);
+            for (int i = 0; i < count; ++i) for (int ch = 0; ch < 2; ++ch) {
+                const AudioBuffer* buffer = &buffers->mBuffers[planar ? ch : 0];
+                size_t index = (first + i) * (planar ? 1 : 2) + (planar ? 0 : ch);
+                if (floating) {
+                    float value = ((const float*)buffer->mData)[index];
+                    pcm[i*2+ch] = !isfinite(value) ? 0 : (int16_t)lrintf(fmaxf(-1.f, fminf(1.f, value)) * 32767.f);
+                } else pcm[i*2+ch] = ((const int16_t*)buffer->mData)[index];
+            }
+            _audioCb(pcm, count, timestamp + (uint32_t)(first * 1000 / 48000), _audioUserData);
+        }
+    }
+    if (retained) CFRelease(retained);
 }
 
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {

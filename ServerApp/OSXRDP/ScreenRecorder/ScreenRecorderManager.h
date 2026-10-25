@@ -12,6 +12,8 @@
 #include "CursorHandler.h"
 #include "../VirtualMon/VirtualMonitor.h"
 
+@class OSXRDPRemoteAudioRoute;
+
 class ScreenRecorderManager {
     
 public:
@@ -19,7 +21,8 @@ public:
     ~ScreenRecorderManager();
         
     void HandleCommand(xipc_t* client, xstream_t* cmd);
-    void Stop();
+    void Stop(bool forResize = false);
+    void SetRemoteAudio(bool enabled);
     void SendDisconnectMsgToClient();
 
 private:
@@ -47,6 +50,8 @@ private:
     
     struct RecordStartParams _recordParams;
 
+    OSXRDPRemoteAudioRoute* _remoteAudioRoute;
+    bool _remoteAudioEnabled = false;
     void* _recorder[16];
     int _recorderCnt;
     
@@ -82,6 +87,7 @@ private:
     void DestroyCursorShm();
     
     bool StartRecord(xstream_t* cmd);
+    static void HandleAudio(const int16_t* pcm, int frames, uint32_t timestamp, void* userData);
     bool InitRFXConversion();
     
     bool ParseStartRecordParams(xstream_t* cmd, RecordStartParams* params);

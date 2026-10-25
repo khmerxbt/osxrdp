@@ -17,7 +17,7 @@ osxrdp is an unofficial module of xrdp to support rdp server in macOS.
 |Advanced Clipboard (Image, Rich Text)|✅|
 |Multiple monitor (only H.264)|✅|
 |File transfer| ✅ |
-|Audio|❌|
+|Audio (user session, macOS 13+)|✅ PCM; local suppression requires macOS 14.2+|
 
 
 ## Manual
@@ -31,3 +31,11 @@ Support Apple Silicon & Intel mac.
 osxrdp is based on xrdp v0.10.6.1. \
 To improve H.264 video quality on macOS, I made a few adjustments to the encoder settings. The corresponding changes can be found in scripts/xrdp_patch.patch.
 
+
+## This contribution
+
+**The fixes in this contribution are 100% AI-coded using OpenAI Codex**, with requirements and device testing supplied by the human contributor. Existing upstream code retains its original authorship.
+
+See the [consolidated fixes](docs/LOCAL-FIXES.md), [known issues and compatibility limits](docs/KNOWN-ISSUES.md), and [regression tests](tests/README.md). The tested iPad still requires disconnect/reconnect for resolution changes; live resizing is not claimed as fixed.
+
+The server changes require rebuilding XRDP 0.10.6.1. Apply `scripts/apply_xrdp_patches.sh /path/to/fresh/xrdp-0.10.6.1` before building; the script applies the core patch and the separate bundled-librfxcodec ARM64 optimization. It does not install binaries or modify a running service.

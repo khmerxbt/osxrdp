@@ -36,6 +36,7 @@ private:
         int displayIdx;
         unsigned int shmReadPos;
         bool inUse;
+        uint64_t submittedUs;
     };
 
     bool _inited;
@@ -60,6 +61,10 @@ private:
     int _inFlightHead;
     int _inFlightCount;
     int _needPaintDisplay[16];
+    uint64_t _profileStartUs = 0;
+    uint64_t _profileFrames = 0, _profileAcked = 0, _profileMerged = 0;
+    uint64_t _profilePackUs = 0, _profileAckUs = 0, _profileMaxAckUs = 0;
+    void ReportFrameMetrics();
     
     bool GetPaintData(screenrecord_frame_t* outFrameInfo, char** outImgData, size_t* outImgDataSize, int* outWidth, int* outHeight, unsigned int* frame_id, int displayIdx);
     void MergeDirtyFrames(const screenrecord_shm_t* shm, unsigned int begin, unsigned int end, screenrecord_frame_t* frame);

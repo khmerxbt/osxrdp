@@ -1,0 +1,51 @@
+--- a/src/rfxencode_dwt_shift_rem.c
++++ b/src/rfxencode_dwt_shift_rem.c
+@@ -26,6 +26,9 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#if defined(__aarch64__)
++#include <arm_neon.h>
++#endif
+ 
+ #include "rfxcommon.h"
+ #include "rfxencode_dwt_shift_rem.h"
+@@ -36,6 +39,30 @@
+ rfx_encode_dwt_shift_rem_vert_lv1_u8(const uint8 *in_buffer,
+                                      sint16 *out_buffer)
+ {
++#if defined(__aarch64__)
++    /* Independent columns share arithmetic; keep the scalar lifting order,
++     * signed shifts and reduce-extrapolate boundary coefficients exactly. */
++    for (int col = 0; col < 64; col += 8)
++    {
++        int16x8_t even = vshlq_n_s16(vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vld1_u8(in_buffer + col))), vdupq_n_s16(128)), DWT_FACTOR);
++        int16x8_t previous = vdupq_n_s16(0);
++        for (int row = 0; row < 31; ++row)
++        {
++            int16x8_t odd = vshlq_n_s16(vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vld1_u8(in_buffer + (2 * row + 1) * 64 + col))), vdupq_n_s16(128)), DWT_FACTOR);
++            int16x8_t next = vshlq_n_s16(vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vld1_u8(in_buffer + (2 * row + 2) * 64 + col))), vdupq_n_s16(128)), DWT_FACTOR);
++            int16x8_t high = vshrq_n_s16(vsubq_s16(odd, vshrq_n_s16(vaddq_s16(even, next), 1)), 1);
++            int16x8_t low = vaddq_s16(even, row == 0 ? high : vshrq_n_s16(vaddq_s16(previous, high), 1));
++            vst1q_s16(out_buffer + row * 64 + col, low);
++            vst1q_s16(out_buffer + (33 + row) * 64 + col, high);
++            previous = high;
++            even = next;
++        }
++        /* Extrapolation makes H[31] zero; the mirrored H[32] is zero too. */
++        int16x8_t last = vshlq_n_s16(vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vld1_u8(in_buffer + 63 * 64 + col))), vdupq_n_s16(128)), DWT_FACTOR);
++        vst1q_s16(out_buffer + 31 * 64 + col, vaddq_s16(even, vshrq_n_s16(previous, 1)));
++        vst1q_s16(out_buffer + 32 * 64 + col, vsubq_s16(vaddq_s16(last, last), even));
++    }
++#else
+     const uint8 *ic; /* input coefficients */
+     sint16 *lo;
+     sint16 *hi;
+@@ -83,6 +110,7 @@
+         hn = (x2n1 - ((x2n + x2n2) >> 1)) >> 1;
+         OC_L0(32, NOQ(x2n + (hn >> 1)));
+     }
++#endif
+ }
+ 
+ /******************************************************************************/

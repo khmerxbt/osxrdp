@@ -219,7 +219,7 @@ lib_mod_get_wait_objs(struct mod *mod, void *read_objs, int *rcount,
 {
     mod->connectionManager->GetWaitObjects(read_objs, rcount);
 
-    *timeout = 100;
+    if (*timeout < 0 || *timeout > 100) *timeout = 100;
     
     return 0;
 }
@@ -287,6 +287,13 @@ lib_send_server_monitor_resize(struct mod *mod, int width, int height,
                                const struct monitor_info *monitors,
                                int *in_progress)
 {
+    if (in_progress == NULL) return 1;
+    *in_progress = 0;
+    if (mod == NULL || mod->connectionManager == NULL
+        || !mod->connectionManager->Resize(mod, width, height, num_monitors, monitors)) {
+        return 1;
+    }
+    *in_progress = 1;
     return 0;
 }
 

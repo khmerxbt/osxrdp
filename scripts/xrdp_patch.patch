@@ -10,14 +10,176 @@
                  /* Set encode parameters from config */
                  encParamExt.bEnableFrameSkip = og->openh264_param[ct].EnableFrameSkip;
                  encParamExt.iTargetBitrate = og->openh264_param[ct].TargetBitrate;
-@@ -205,8 +208,10 @@
+@@ -205,6 +208,8 @@
                  slc->iVideoHeight = encParamExt.iPicHeight;
                  slc->iSpatialBitrate = encParamExt.iTargetBitrate;
                  slc->iMaxSpatialBitrate = encParamExt.iMaxBitrate;
-+
-                 slc->bVideoSignalTypePresent = 1;
-                 slc->bFullRange = 1;
-+
++                slc->bVideoSignalTypePresent = 1;
++                slc->bFullRange = 1;
                  status = ENC_INITIALIZE_EXT(
                               oe->openh264_enc_han, &encParamExt);
                  LOG(LOG_LEVEL_INFO, "xrdp_encoder_openh264_encode: "
+--- a/xrdp/xrdp_types.h
++++ b/xrdp/xrdp_types.h
+@@ -20,6 +20,7 @@
+ 
+ #ifndef _XRDP_TYPES_H_
+ #define _XRDP_TYPES_H_
++#include "display_control_fragments.h"
+ 
+ #define DEFAULT_STRING_LEN 255
+ #define LOG_WINDOW_CHAR_PER_LINE 60
+@@ -441,6 +442,7 @@
+     int cs2xr_cid_map[256];
+     int xr2cr_cid_map[256];
+     int dynamic_monitor_chanid;
++    struct xrdp_display_control_fragments display_control_fragments;
+     struct xrdp_egfx *egfx;
+     int egfx_up;
+     enum xrdp_egfx_flags egfx_flags;
+--- a/xrdp/xrdp_mm.c
++++ b/xrdp/xrdp_mm.c
+@@ -1175,7 +1175,7 @@
+     struct stream *s;
+     int bytes;
+ 
+-    LOG_DEVEL(LOG_LEVEL_TRACE, "dynamic_monitor_open_response: chan_id %d "
++    LOG(LOG_LEVEL_INFO, "dynamic_monitor_open_response: chan_id %d "
+               "creation_status 0x%8.8x", chan_id, creation_status);
+     if (creation_status != 0)
+     {
+@@ -1193,7 +1193,8 @@
+     out_uint32_le(s, 2048); /* MaxMonitorAreaFactorB */
+     s_mark_end(s);
+     bytes = (int) (s->end - s->data);
+-    libxrdp_drdynvc_data(wm->session, chan_id, s->data, bytes);
++    int send_error = libxrdp_drdynvc_data(wm->session, chan_id, s->data, bytes);
++    LOG(LOG_LEVEL_INFO, "[OSXRDP display control] capabilities sent channel=%d status=%d", chan_id, send_error);
+     free_stream(s);
+     return 0;
+ }
+@@ -1208,11 +1209,27 @@
+ 
+ /******************************************************************************/
+ static int
++dynamic_monitor_process_data(intptr_t id, int chan_id, char *data, int bytes);
++
++static int
++dynamic_monitor_receive(intptr_t id, int chan_id, char *data, int bytes, int total, int first)
++{
++    struct xrdp_process *pro = (struct xrdp_process *)id;
++    const char *complete;
++    int complete_bytes;
++    int result = xrdp_display_control_feed(&pro->wm->mm->display_control_fragments,
++        data, bytes, total, first, &complete, &complete_bytes);
++    LOG(LOG_LEVEL_INFO, "[OSXRDP display control] first=%d bytes=%d total=%d result=%d", first, bytes, total, result);
++    if (result < 0) return 1;
++    if (result == 0) return 0;
++    return dynamic_monitor_process_data(id, chan_id, (char *)complete, complete_bytes);
++}
++
++static int
+ dynamic_monitor_data_first(intptr_t id, int chan_id, char *data, int bytes,
+                            int total_bytes)
+ {
+-    LOG_DEVEL(LOG_LEVEL_TRACE, "dynamic_monitor_data_first:");
+-    return 0;
++    return dynamic_monitor_receive(id, chan_id, data, bytes, total_bytes, 1);
+ }
+ 
+ /******************************************************************************/
+@@ -1673,6 +1690,12 @@
+ static int
+ dynamic_monitor_data(intptr_t id, int chan_id, char *data, int bytes)
+ {
++    return dynamic_monitor_receive(id, chan_id, data, bytes, 0, 0);
++}
++
++static int
++dynamic_monitor_process_data(intptr_t id, int chan_id, char *data, int bytes)
++{
+     int error = 0;
+     struct stream ls;
+     struct stream *s;
+@@ -1703,6 +1726,11 @@
+     s = &ls;
+     in_uint32_le(s, msg_type);
+     in_uint32_le(s, msg_length);
++    if (msg_length != bytes || (msg_type == DISPLAYCONTROL_PDU_TYPE_MONITOR_LAYOUT && bytes < 16))
++    {
++        LOG(LOG_LEVEL_ERROR, "[OSXRDP display control] invalid complete PDU length %d/%d", msg_length, bytes);
++        return 1;
++    }
+     LOG_DEVEL(LOG_LEVEL_DEBUG,
+               "dynamic_monitor_data: msg_type %d msg_length %d",
+               msg_type, msg_length);
+@@ -1753,7 +1781,7 @@
+             " out of memory adding resize request to queue");
+         return error;
+     }
+-    LOG(LOG_LEVEL_DEBUG, "dynamic_monitor_data:"
++    LOG(LOG_LEVEL_INFO, "dynamic_monitor_data:"
+         " received width %d, received height %d, queue %s",
+         description.session_width,
+         description.session_height,
+@@ -2201,6 +2229,7 @@
+         return error;
+     }
+     error = dynamic_monitor_initialize(self);
++    LOG(LOG_LEVEL_INFO, "[OSXRDP display control] open requested channel=%d status=%d", self->dynamic_monitor_chanid, error);
+     if (error != 0)
+     {
+         LOG(LOG_LEVEL_INFO, "Dynamic monitor initialize failed."
+--- /dev/null
++++ b/xrdp/display_control_fragments.h
+@@ -0,0 +1,50 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++#ifndef XRDP_DISPLAY_CONTROL_FRAGMENTS_H
++#define XRDP_DISPLAY_CONTROL_FRAGMENTS_H
++#include <string.h>
++/* MS-RDPEDISP: 8-byte header, 8-byte layout prefix, at most 16 40-byte monitors. */
++#define XRDP_DISPLAY_CONTROL_MAX_PDU (16 + 16 * 40)
++struct xrdp_display_control_fragments
++{
++    unsigned char data[XRDP_DISPLAY_CONTROL_MAX_PDU];
++    int expected;
++    int used;
++};
++/* Returns -1 for invalid input, 0 while incomplete, 1 with a complete PDU.
++ * The returned pointer remains valid until the next call. No allocation. */
++static inline int
++xrdp_display_control_feed(struct xrdp_display_control_fragments *state,
++                          const char *data, int bytes, int total, int first,
++                          const char **complete, int *complete_bytes)
++{
++    *complete = NULL;
++    *complete_bytes = 0;
++    if (data == NULL || bytes <= 0 || bytes > XRDP_DISPLAY_CONTROL_MAX_PDU)
++        goto invalid;
++    if (first)
++    {
++        if (state->expected != 0 || total < 8 || total > XRDP_DISPLAY_CONTROL_MAX_PDU || bytes > total)
++            goto invalid;
++        state->expected = total;
++        state->used = 0;
++    }
++    if (state->expected == 0)
++    {
++        if (bytes < 8) goto invalid;
++        *complete = data;
++        *complete_bytes = bytes;
++        return 1;
++    }
++    if (bytes > state->expected - state->used) goto invalid;
++    memcpy(state->data + state->used, data, bytes);
++    state->used += bytes;
++    if (state->used != state->expected) return 0;
++    *complete = (const char *)state->data;
++    *complete_bytes = state->used;
++    state->used = state->expected = 0;
++    return 1;
++invalid:
++    state->used = state->expected = 0;
++    return -1;
++}
++#endif

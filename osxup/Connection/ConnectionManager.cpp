@@ -3,6 +3,7 @@
 #include "ConnectionManager.h"
 #include "osxrdp/packet.h"
 #include "utils.h"
+#include <syslog.h>
 
 // session manager 서버 이름
 static const char* OSXRDP_SESSIONMANAGER_NAME = "/tmp/osxrdpsessionmanager";
@@ -28,7 +29,9 @@ ConnectionManager::ConnectionManager() :
     _sessionId(0),
     _mod(NULL),
     _pendingInputSync(false),
-    _pendingToggleFlags(0)
+    _pendingToggleFlags(0),
+    _resizePending(false),
+    _resizeCaptureReady(false)
 {}
 
 ConnectionManager::~ConnectionManager() {}
@@ -108,6 +111,8 @@ void ConnectionManager::Release() {
     _channelManager.Release();
     
     _inited = false;
+    _resizePending = false;
+    _resizeCaptureReady = false;
 }
 
 void ConnectionManager::KeepAlive() {
@@ -217,6 +222,66 @@ bool ConnectionManager::NeedTerminate() {
 
 void ConnectionManager::SetSuppress(bool suppress) {
     _statusManager.SetSuppressed(suppress);
+    // XRDP unsuppresses only after its resized surfaces and encoder are ready.
+    // Rebuild paint objects here, never against the old graphics surfaces.
+    if (!suppress && _resizePending && _resizeCaptureReady) {
+        _resizePending = false;
+        _resizeCaptureReady = false;
+        if (!_PreparePaint()) {
+            _statusManager.SetStopping();
+        }
+    }
+}
+
+bool ConnectionManager::Resize(struct mod* mod, int width, int height,
+                               int monitorCount, const struct monitor_info* monitors) {
+    syslog(LOG_NOTICE, "[OSXRDP resize] requested %dx%d monitors=%d pending=%d ready=%d",
+           width, height, monitorCount, _resizePending,
+           _statusManager.CheckCanAcceptInput());
+    if (mod == NULL || mod != _mod || !_inited || _agentIpc == NULL
+        || _resizePending || !_statusManager.CheckCanAcceptInput()
+        || width < 2 || height < 2 || width > 10000 || height > 10000
+        || monitorCount < 0 || monitorCount > 16
+        || (monitorCount > 0 && monitors == NULL)) {
+        return false;
+    }
+    if (monitorCount > 1 && PaintManager::CheckRecordFormat(mod) != OSXRDP_RECORDFORMAT_NV12_PACKED) {
+        return false;
+    }
+
+    const bool lockscreen = _statusManager.CheckReconnection();
+    // XRDP has already stopped output and deleted the old encoder before this
+    // callback, so its asynchronous readers no longer own the old mappings.
+    _statusManager.SetAgentConnected(lockscreen);
+    _command.SendRecordStopMsg(_agentIpc, true);
+    _paintManager.Release();
+
+    mod->width = width & ~1;
+    mod->height = height & ~1;
+    struct display_size_description* sizes = &mod->client_info.display_sizes;
+    memset(sizes, 0, sizeof(*sizes));
+    sizes->session_width = mod->width;
+    sizes->session_height = mod->height;
+    sizes->monitorCount = monitorCount;
+    int minLeft = 0;
+    int minTop = 0;
+    for (int i = 0; i < monitorCount; ++i) {
+        if (monitors[i].left < minLeft) minLeft = monitors[i].left;
+        if (monitors[i].top < minTop) minTop = monitors[i].top;
+    }
+    for (int i = 0; i < monitorCount; ++i) {
+        sizes->minfo[i] = monitors[i];
+        sizes->minfo_wm[i] = monitors[i];
+        sizes->minfo_wm[i].left -= minLeft;
+        sizes->minfo_wm[i].right -= minLeft;
+        sizes->minfo_wm[i].top -= minTop;
+        sizes->minfo_wm[i].bottom -= minTop;
+    }
+    _resizePending = true;
+    _resizeCaptureReady = false;
+    _RequestRecording();
+    syslog(LOG_NOTICE, "[OSXRDP resize] capture restart requested %dx%d", mod->width, mod->height);
+    return true;
 }
 
 void ConnectionManager::Terminate() {
@@ -238,6 +303,15 @@ void ConnectionManager::HandleChannelMsg(long param1, long param2, long param3, 
     int dataLen = (int)param2;
     const char* data = (const char*)param3;
     int totalLen = (int)param4;
+    bool wasAudioReady = _channelManager.IsAudioReady();
+    if (_channelManager.HandleAudioChannel(channelId, channelFlags, data, dataLen, totalLen)) {
+        bool ready = _channelManager.IsAudioReady();
+        if (_agentIpc && ready != wasAudioReady) {
+            int message[] = { OSXRDP_CMDTYPE_AUDIO_REMOTE, ready ? 1 : 0 };
+            xipc_send_data(_agentIpc, message, sizeof(message));
+        }
+        return;
+    }
     
     // 유효한 (처리하는) 이벤트인지 확인
     int channel_msg_type = _channelManager.IsValidChannelMsg(channelId, channelFlags, data, dataLen, totalLen);
@@ -328,16 +402,17 @@ bool ConnectionManager::_ConnectToAgent(int sessionId, bool isLockScreen) {
     _statusManager.SetAgentConnected(isLockScreen);
     
     // 화면 녹화 데이터 요청
-    if (_mod->client_info.display_sizes.monitorCount == 0) {
-        _command.SendRecordStartMsg(ipc, _mod->width, _mod->height, PaintManager::CheckRecordFormat(_mod), _mod->usevirtualmon, 0, 0);
-    }
-    else {
-        _command.SendRecordStartMsg(ipc, _mod->width, _mod->height, PaintManager::CheckRecordFormat(_mod), _mod->usevirtualmon, _mod->client_info.display_sizes.monitorCount, (struct monitor_info*)_mod->client_info.display_sizes.minfo_wm);
-    }
+    _agentIpc = ipc;
+    _RequestRecording();
     
     
     // 클립보드 활성화
     _channelManager.SendClipboardServerInit();
+    if (!isLockScreen) {
+        int message[] = { OSXRDP_CMDTYPE_AUDIO_REMOTE, 0 };
+        xipc_send_data(_agentIpc, message, sizeof(message));
+        _channelManager.SendAudioServerInit();
+    }
     
     _agentIpc = ipc;
 
@@ -361,6 +436,13 @@ bool ConnectionManager::_PreparePaint() {
     }
     
     return true;
+}
+
+void ConnectionManager::_RequestRecording() {
+    const struct display_size_description* sizes = &_mod->client_info.display_sizes;
+    _command.SendRecordStartMsg(_agentIpc, _mod->width, _mod->height,
+        PaintManager::CheckRecordFormat(_mod), _mod->usevirtualmon,
+        sizes->monitorCount, (struct monitor_info*)sizes->minfo_wm);
 }
 
 void ConnectionManager::_HandleSessionMessage(int sessionId, int isLockScreen) {
@@ -432,6 +514,15 @@ int ConnectionManager::_OnReceivedAgentManagerMessage(xipc_t* t, xipc_t* client,
     int cmdType = xstream_readInt32(stream);
     
     switch (cmdType) {
+        case OSXRDP_CMDTYPE_AUDIO: {
+            if (len < 12 || _this->_statusManager.CheckReconnection()) break;
+            unsigned int timestamp = (unsigned int)xstream_readInt32(stream);
+            int bytes = xstream_readInt32(stream);
+            if (bytes <= 0 || bytes > 4096 || bytes % 4 || xstream_getRemaining(stream) != bytes) break;
+            const void* pcm = xstream_readData(stream, bytes);
+            if (pcm) _this->_channelManager.SendAudioPcm(pcm, bytes, timestamp);
+            break;
+        }
         case OSXRDP_CMDTYPE_NEEDPAINT: {
             int displayIdx = xstream_readInt32(stream);
             
@@ -443,7 +534,16 @@ int ConnectionManager::_OnReceivedAgentManagerMessage(xipc_t* t, xipc_t* client,
             int packetType = xstream_readInt32(stream);
             if (packetType == OSXRDP_PACKETTYPE_REP_SCREEN) {
                 int re = xstream_readInt32(stream);
-                if (re != 1 || _this->_PreparePaint() == false) {
+                if (_this->_resizePending) {
+                    _this->_resizeCaptureReady = (re == 1);
+                    if (re != 1) {
+                        _this->_statusManager.SetStopping();
+                    }
+                    // Complete the asynchronous callback; XRDP now resets its
+                    // own graphics state before permitting new paint output.
+                    _this->_mod->server_monitor_resize_done((struct mod*)_this->_mod);
+                }
+                else if (re != 1 || _this->_PreparePaint() == false) {
                     // log
                     _this->_statusManager.SetStopping();
                 }

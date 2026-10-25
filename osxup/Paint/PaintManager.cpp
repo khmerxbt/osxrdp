@@ -8,6 +8,13 @@
 #include "utils.h"
 #include <limits.h>
 #include <sys/mman.h>
+#include <time.h>
+#include <syslog.h>
+
+static uint64_t RenderClockUs() {
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000000 + now.tv_nsec / 1000;
+}
 
 static const char* OSXRDP_SCREENSHM_NAME = "/osxrdpshm";
 static const char* OSXRDP_CURSORSHM_NAME = "/osxrdpcursorshm";
@@ -134,7 +141,9 @@ int PaintManager::Initialize(const struct mod* mod, int recordFormat, int sessio
     _mod = mod;
     _releasePending = false;
     ResetInFlight();
-    
+    _profileStartUs = RenderClockUs();
+    _profileFrames = _profileAcked = _profileMerged = 0;
+    _profilePackUs = _profileAckUs = _profileMaxAckUs = 0;
     _inited = true;
     
     return true;
@@ -206,6 +215,7 @@ void PaintManager::Paint() {
         return;
     }
     
+    ReportFrameMetrics();
     // 마우스 커서 그리기
     PaintMouseCursor();
     
@@ -263,7 +273,10 @@ void PaintManager::Paint() {
             _inPainting = (_inFlightCount > 0);
 
             // 그리기
+            uint64_t before = RenderClockUs();
             _paint->DoPaint(_mod, &frameInfo, payload, payloadBytes, frame_id, i, width, height);
+            _profilePackUs += RenderClockUs() - before;
+            _profileFrames++;
             
             cnt++;
         }
@@ -305,6 +318,7 @@ bool PaintManager::GetPaintData(screenrecord_frame_t* outFrameInfo, char** outIm
         forceRedrawAll = 1;
     }
 
+    _profileMerged += targetPos - beginPos;
     unsigned int idx = targetPos % FRAME_SLOTS;
     screenrecord_frame_t* frame = &(shm->frames[idx]);
     char* imgData = (char*)shm + shm->screenrecord_data_offset
@@ -419,6 +433,7 @@ bool PaintManager::PushInFlight(int displayIdx, unsigned int shmReadPos, unsigne
     _inFlightFrames[slot].displayIdx = displayIdx;
     _inFlightFrames[slot].shmReadPos = shmReadPos;
     _inFlightFrames[slot].inUse = true;
+    _inFlightFrames[slot].submittedUs = RenderClockUs();
 
     int tail = (_inFlightHead + _inFlightCount) % IN_FLIGHT_SLOT_COUNT;
     _inFlightSlotQueue[tail] = slot;
@@ -454,6 +469,9 @@ int PaintManager::PopAckedInFlight(int ackFrameId, unsigned int* outMaxReadPosBy
             }
         }
 
+        uint64_t elapsed = RenderClockUs() - frame->submittedUs;
+        _profileAcked++; _profileAckUs += elapsed;
+        _profileMaxAckUs = elapsed > _profileMaxAckUs ? elapsed : _profileMaxAckUs;
         frame->inUse = false;
         _freeInFlightSlots[_freeInFlightCount++] = slot;
         _inFlightHead = (_inFlightHead + 1) % IN_FLIGHT_SLOT_COUNT;
@@ -481,6 +499,22 @@ void PaintManager::ResetInFlight() {
         _inFlightCountByDisplay[i] = 0;
         _nextSubmitPos[i] = shm == NULL ? 0 : atomic_load_explicit(&shm->read_pos, memory_order_acquire);
     }
+}
+
+void PaintManager::ReportFrameMetrics() {
+    uint64_t now = RenderClockUs();
+    if (!_profileStartUs || now - _profileStartUs < 5000000) return;
+    if (_profileFrames || _profileAcked) {
+        syslog(LOG_NOTICE, "[OSXRDP render] fps=%.1f frames=%llu acked=%llu merged=%llu in_flight=%d pack_ms=%.2f completion_ms=%.2f max_completion_ms=%.2f",
+            _profileFrames * 1000000.0 / (now - _profileStartUs),
+            (unsigned long long)_profileFrames, (unsigned long long)_profileAcked,
+            (unsigned long long)_profileMerged, _inFlightCount,
+            _profileFrames ? _profilePackUs / (1000.0 * _profileFrames) : 0,
+            _profileAcked ? _profileAckUs / (1000.0 * _profileAcked) : 0, _profileMaxAckUs / 1000.0);
+    }
+    _profileStartUs = now;
+    _profileFrames = _profileAcked = _profileMerged = 0;
+    _profilePackUs = _profileAckUs = _profileMaxAckUs = 0;
 }
 
 void PaintManager::PaintEnd(int ackFrameId) {
